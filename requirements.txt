@@ -1,0 +1,25 @@
+# Core deep learning frameworks
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Computer vision
+opencv-python>=4.8.0
+Pillow>=9.0.0
+numpy>=1.24.0
+
+# HuggingFace libraries
+transformers>=4.35.0
+datasets>=2.14.0
+
+# Vector database
+chromadb>=0.4.0
+
+# Embeddings
+sentence-transformers>=2.2.0
+
+# Utilities
+tqdm>=4.65.0
+hf_transfer>=0.1.9
+einops>=0.8.1
+timm>=1.0.22
+sentencepiece>=0.2.1

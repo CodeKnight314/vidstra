@@ -1,0 +1,7 @@
+vectordb/chroma.sqlite3
+vectordb/9d99e8fb-299f-4748-9695-fbc3bff45bb6/data_level0.bin
+vectordb/9d99e8fb-299f-4748-9695-fbc3bff45bb6/header.bin
+vectordb/9d99e8fb-299f-4748-9695-fbc3bff45bb6/index_metadata.pickle
+vectordb/9d99e8fb-299f-4748-9695-fbc3bff45bb6/length.bin
+vectordb/9d99e8fb-299f-4748-9695-fbc3bff45bb6/link_lists.bin
+vectordb/.DS_Store

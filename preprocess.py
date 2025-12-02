@@ -1,99 +1,30 @@
 import cv2 as cv
 import os
-import numpy as np
 import torch
-import torchvision.transforms as T
 from PIL import Image
-from torchvision.transforms.functional import InterpolationMode
-from transformers import AutoModel, AutoTokenizer
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from glob import glob
 import chromadb
-from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
 VECTORDB_PATH = "/projects/vig/tangri/vectordb.chroma"
 DATA_ROOT = "/projects/vig/Datasets/VSI-Bench/videos"
 DATASET_PATH = "nyu-visionx/VSI-Bench"
 FPS = 2
 
-def build_transform(input_size):
-    MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
-    transform = T.Compose([
-        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
-        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
-        T.ToTensor(),
-        T.Normalize(mean=MEAN, std=STD)
-    ])
-    return transform
-
-def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
-    best_ratio_diff = float('inf')
-    best_ratio = (1, 1)
-    area = width * height
-    for ratio in target_ratios:
-        target_aspect_ratio = ratio[0] / ratio[1]
-        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
-        if ratio_diff < best_ratio_diff:
-            best_ratio_diff = ratio_diff
-            best_ratio = ratio
-        elif ratio_diff == best_ratio_diff:
-            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
-                best_ratio = ratio
-    return best_ratio
-
-def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
-    orig_width, orig_height = image.size
-    aspect_ratio = orig_width / orig_height
-    target_ratios = set(
-        (i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1) if
-        i * j <= max_num and i * j >= min_num)
-    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
-    target_aspect_ratio = find_closest_aspect_ratio(
-        aspect_ratio, target_ratios, orig_width, orig_height, image_size)
-    target_width = image_size * target_aspect_ratio[0]
-    target_height = image_size * target_aspect_ratio[1]
-    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
-    resized_img = image.resize((target_width, target_height))
-    processed_images = []
-    for i in range(blocks):
-        box = (
-            (i % (target_width // image_size)) * image_size,
-            (i // (target_width // image_size)) * image_size,
-            ((i % (target_width // image_size)) + 1) * image_size,
-            ((i // (target_width // image_size)) + 1) * image_size
-        )
-        split_img = resized_img.crop(box)
-        processed_images.append(split_img)
-    assert len(processed_images) == blocks
-    if use_thumbnail and len(processed_images) != 1:
-        thumbnail_img = image.resize((image_size, image_size))
-        processed_images.append(thumbnail_img)
-    return processed_images
-
-def load_image(image_file, input_size=448, max_num=12):
-    if isinstance(image_file, str):
-        image = Image.open(image_file).convert('RGB')
-    else:
-        image = image_file.convert('RGB') if image_file.mode != 'RGB' else image_file
-    transform = build_transform(input_size=input_size)
-    images = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
-    pixel_values = [transform(image) for image in images]
-    pixel_values = torch.stack(pixel_values)
-    return pixel_values
-
 def build_model():
-    path = 'OpenGVLab/InternVL2-8B'
-    model = AutoModel.from_pretrained(
-        path,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        use_flash_attn=True,
-        trust_remote_code=True).eval().cuda()
-    tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=False)
-    return model, tokenizer
+    """Load Qwen3-VL model for image captioning."""
+    model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
+    
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        attn_implementation="flash_attention_2"
+    )
+    processor = AutoProcessor.from_pretrained(model_name)
+    return model, processor
 
 def build_embedding_model(model_name: str = "all-MiniLM-L6-v2"):
     """Load sentence transformer for text embeddings."""
@@ -129,26 +60,49 @@ def sample_videos(video_path: str, fps: int):
     video.release()
     return sampled_frames, sampled_frame_timestamps, sampled_frame_index
 
-def preprocess_video(video_path: str, fps: int, model: AutoModel, tokenizer: AutoTokenizer):
+def preprocess_video(video_path: str, fps: int, model, processor):
     sampled_frames, sampled_frame_timestamps, sampled_frame_index = sample_videos(video_path, fps)
-    generation_config = dict(max_new_tokens=1024, do_sample=True)
     sampled_frames_caption = []
 
-    for frame, timestamp, index in zip(sampled_frames, sampled_frame_timestamps, sampled_frame_index):
+    for frame, timestamp, index in tqdm(
+        zip(sampled_frames, sampled_frame_timestamps, sampled_frame_index),
+        total=len(sampled_frames),
+        desc="Captioning frames",
+        leave=False
+    ):
         frame_pil = Image.fromarray(cv.cvtColor(frame, cv.COLOR_BGR2RGB))
-        pixel_values = load_image(frame_pil, input_size=448, max_num=12).to(torch.bfloat16).cuda()
         
-        question = """<image>\n
-        You are generating a structured spatial description of this frame.
-        Describe:
-        1. The main objects visible.
-        2. Their approximate positions in the frame (left, right, center, background, foreground).
-        3. Any meaningful spatial relations (X is left of Y, X is behind Y, X is closer than Y).
-        Keep the description short but spatially detailed.
-        """
-
-        response = model.chat(tokenizer, pixel_values, question, generation_config)
-        sampled_frames_caption.append(response)
+        # Qwen3-VL chat format
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": frame_pil},
+                    {"type": "text", "text": "Describe the main objects visible, their approximate positions in the frame (left, right, center, background, foreground), and any meaningful spatial relations. Keep the description short but spatially detailed."}
+                ]
+            }
+        ]
+        
+        # Apply chat template and process
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(
+            text=[text],
+            images=[frame_pil],
+            padding=True,
+            return_tensors="pt"
+        ).to(model.device)
+        
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=150,
+                do_sample=False
+            )
+        
+        # Decode only the generated tokens (exclude input)
+        generated_ids = output_ids[:, inputs.input_ids.shape[1]:]
+        caption = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+        sampled_frames_caption.append(caption)
 
     return sampled_frames_caption, sampled_frame_timestamps, sampled_frame_index
 
@@ -186,13 +140,10 @@ def connect_vectordb(vectordb_path: str):
     client, collection = setup_chromadb(vectordb_path)
     return client, collection, embedding_model
 
-
 def setup_vectordb(vectordb_path: str, video_path: str, fps: int):
     """Full preprocessing: loads VLM, processes videos, and stores in ChromaDB."""
-    vlm_model, tokenizer = build_model()
-    
+    caption_model, processor = build_model()
     embedding_model = build_embedding_model()
-    
     client, collection = setup_chromadb(vectordb_path)
     
     video_files = glob(os.path.join(video_path, "**/*.mp4"), recursive=True)
@@ -208,7 +159,7 @@ def setup_vectordb(vectordb_path: str, video_path: str, fps: int):
             continue
         
         captions, timestamps, frame_indices = preprocess_video(
-            video_file, fps, vlm_model, tokenizer
+            video_file, fps, caption_model, processor
         )
         
         add_frames_to_db(
