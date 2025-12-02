@@ -2,33 +2,36 @@ import cv2 as cv
 import os
 import torch
 from PIL import Image
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from transformers import Blip2Processor, Blip2ForConditionalGeneration
 from glob import glob
 import chromadb
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
+import numpy as np
 
-VECTORDB_PATH = "/projects/vig/tangri/vectordb.chroma"
+VECTORDB_PATH = "/projects/vig/tangri/vectordb/"
 DATA_ROOT = "/projects/vig/Datasets/VSI-Bench/videos"
 DATASET_PATH = "nyu-visionx/VSI-Bench"
-FPS = 2
+N_FRAMES = 128  # Number of evenly spaced frames to sample
+
 
 def build_model():
-    """Load Qwen3-VL model for image captioning."""
-    model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
+    """Load BLIP-2 model for image captioning."""
+    model_name = "Salesforce/blip2-opt-2.7b"
     
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    model = Blip2ForConditionalGeneration.from_pretrained(
         model_name,
         torch_dtype=torch.float16,
-        device_map="auto",
-        attn_implementation="flash_attention_2"
+        device_map="auto"
     )
-    processor = AutoProcessor.from_pretrained(model_name)
+    processor = Blip2Processor.from_pretrained(model_name)
     return model, processor
+
 
 def build_embedding_model(model_name: str = "all-MiniLM-L6-v2"):
     """Load sentence transformer for text embeddings."""
     return SentenceTransformer(model_name)
+
 
 def setup_chromadb(db_path: str, collection_name: str = "video_frames"):
     """Initialize persistent ChromaDB."""
@@ -39,72 +42,71 @@ def setup_chromadb(db_path: str, collection_name: str = "video_frames"):
     )
     return client, collection
 
-def sample_videos(video_path: str, fps: int):
-    video = cv.VideoCapture(video_path)
+
+def sample_videos(video_path: str, n_frames: int):
+    cap = cv.VideoCapture(video_path)
+    total = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
+    frame_rate = cap.get(cv.CAP_PROP_FPS)
     
-    frame_count = int(video.get(cv.CAP_PROP_FRAME_COUNT))
-    frame_rate = int(video.get(cv.CAP_PROP_FPS))
-    frame_interval = max(1, frame_rate // fps)
+    if total == 0:
+        cap.release()
+        print(f"⚠️ Empty or broken video: {video_path}")
+        return [], [], []
     
-    sampled_frames, sampled_frame_timestamps, sampled_frame_index = [], [], []
+    idxs = np.linspace(0, total - 1, min(n_frames, total)).astype(int)
     
-    for i in range(0, frame_count, frame_interval):
-        video.set(cv.CAP_PROP_POS_FRAMES, i)
-        ret, frame = video.read()
+    sampled_frames = []
+    sampled_frame_timestamps = []
+    sampled_frame_index = []
+    
+    for idx in idxs:
+        cap.set(cv.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
         if not ret:
-            break
-        sampled_frames.append(frame)
-        sampled_frame_timestamps.append(i / frame_rate)
-        sampled_frame_index.append(i)
+            continue
+        frame = cv.resize(frame, (640, 480))
+        frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+        sampled_frames.append(Image.fromarray(frame))
+        sampled_frame_timestamps.append(idx / frame_rate)
+        sampled_frame_index.append(int(idx))
     
-    video.release()
+    cap.release()
     return sampled_frames, sampled_frame_timestamps, sampled_frame_index
 
-def preprocess_video(video_path: str, fps: int, model, processor):
-    sampled_frames, sampled_frame_timestamps, sampled_frame_index = sample_videos(video_path, fps)
-    sampled_frames_caption = []
 
-    for frame, timestamp, index in tqdm(
-        zip(sampled_frames, sampled_frame_timestamps, sampled_frame_index),
-        total=len(sampled_frames),
+def preprocess_video(video_path: str, n_frames: int, model, processor, batch_size: int = 8):
+    """Process video frames with BLIP-2 captioning in batches."""
+    sampled_frames, sampled_frame_timestamps, sampled_frame_index = sample_videos(video_path, n_frames)
+    sampled_frames_caption = []
+    
+    prompt = "Describe the main objects visible, their positions (left, right, center, background, foreground), and spatial relations. Be concise."
+    
+    # Process in batches for efficiency
+    for i in tqdm(
+        range(0, len(sampled_frames), batch_size),
         desc="Captioning frames",
         leave=False
     ):
-        frame_pil = Image.fromarray(cv.cvtColor(frame, cv.COLOR_BGR2RGB))
+        batch_frames = sampled_frames[i:i + batch_size]
         
-        # Qwen3-VL chat format
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": frame_pil},
-                    {"type": "text", "text": "Describe the main objects visible, their approximate positions in the frame (left, right, center, background, foreground), and any meaningful spatial relations. Keep the description short but spatially detailed."}
-                ]
-            }
-        ]
-        
-        # Apply chat template and process
-        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = processor(
-            text=[text],
-            images=[frame_pil],
-            padding=True,
-            return_tensors="pt"
-        ).to(model.device)
+            images=batch_frames,
+            return_tensors="pt",
+            padding=True
+        ).to(model.device, torch.float16)
         
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs,
-                max_new_tokens=150,
+                max_new_tokens=100,
                 do_sample=False
             )
         
-        # Decode only the generated tokens (exclude input)
-        generated_ids = output_ids[:, inputs.input_ids.shape[1]:]
-        caption = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-        sampled_frames_caption.append(caption)
-
+        captions = processor.batch_decode(output_ids, skip_special_tokens=True)
+        sampled_frames_caption.extend([c.strip() for c in captions])
+    
     return sampled_frames_caption, sampled_frame_timestamps, sampled_frame_index
+
 
 def add_frames_to_db(
     collection,
@@ -115,7 +117,7 @@ def add_frames_to_db(
     frame_indices: list[int]
 ):
     video_name = os.path.basename(video_path)
-    embeddings = embedding_model.encode(captions, show_progress_bar=True).tolist()
+    embeddings = embedding_model.encode(captions, show_progress_bar=False).tolist()
     ids = [f"{video_name}_frame_{idx}" for idx in frame_indices]
     metadatas = [
         {
@@ -134,13 +136,15 @@ def add_frames_to_db(
         documents=captions
     )
 
+
 def connect_vectordb(vectordb_path: str):
     """Connect to existing ChromaDB and load embedding model for queries only."""
     embedding_model = build_embedding_model()
     client, collection = setup_chromadb(vectordb_path)
     return client, collection, embedding_model
 
-def setup_vectordb(vectordb_path: str, video_path: str, fps: int):
+
+def setup_vectordb(vectordb_path: str, video_path: str, n_frames: int):
     """Full preprocessing: loads VLM, processes videos, and stores in ChromaDB."""
     caption_model, processor = build_model()
     embedding_model = build_embedding_model()
@@ -159,7 +163,7 @@ def setup_vectordb(vectordb_path: str, video_path: str, fps: int):
             continue
         
         captions, timestamps, frame_indices = preprocess_video(
-            video_file, fps, caption_model, processor
+            video_file, n_frames, caption_model, processor
         )
         
         add_frames_to_db(
@@ -170,5 +174,6 @@ def setup_vectordb(vectordb_path: str, video_path: str, fps: int):
     tqdm.write(f"\nDatabase setup complete! Total entries: {collection.count()}")
     return client, collection, embedding_model
 
+
 if __name__ == "__main__":
-    setup_vectordb(VECTORDB_PATH, DATA_ROOT, FPS)
+    setup_vectordb(VECTORDB_PATH, DATA_ROOT, N_FRAMES)

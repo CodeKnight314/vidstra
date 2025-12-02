@@ -16,10 +16,9 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from preprocess import connect_vectordb
 
-VECTORDB_PATH = "/projects/vig/tangri/vectordb.chroma"
+VECTORDB_PATH = "/projects/vig/tangri/vectordb/"
 DATA_ROOT = "/projects/vig/Datasets/VSI-Bench/videos"
 DATASET_PATH = "nyu-visionx/VSI-Bench"
-FPS = 2
 
 def search_video_memory(collection, embedding_model, video_name, query, top_k=5):
     """Retrieve spatial memory relevant to a query for a given video."""
